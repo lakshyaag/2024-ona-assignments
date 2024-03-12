@@ -8,13 +8,15 @@ output:
   pdf_document: default
 ---
 
-```{r setup, include=FALSE}
-library(tidyverse)
-library(igraph)
+
+
+
+```r
+print("Hello, network!")
 ```
 
-```{r}
-print("Hello, network!")
+```
+## [1] "Hello, network!"
 ```
 
 
