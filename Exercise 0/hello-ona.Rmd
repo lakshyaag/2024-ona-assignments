@@ -3,15 +3,23 @@ title: 'Lecture 0: ORGB 672'
 author: "Lakshya Agarwal"
 date: "2024-03-12"
 output:
-  html_document: 
-    keep_md: true
-  pdf_document: default
+  pdf_document: 
+    toc: true
+    number_sections: true
+    highlight: tango
+  github_document:
+    toc: true
 ---
 
-```{r setup, include=FALSE}
+\newpage
+# Setup
+
+```{r setup, echo=T, results='hide'}
 library(tidyverse)
 library(igraph)
 ```
+
+# Code
 
 ```{r}
 print("Hello, network!")
