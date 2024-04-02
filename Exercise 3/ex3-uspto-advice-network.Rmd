@@ -1,0 +1,419 @@
+---
+title: 'Exercise 3: ORGB 672'
+author: "Lakshya Agarwal"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+  pdf_document: 
+    toc: true
+    number_sections: true
+    highlight: tango
+---
+
+\newpage
+
+# Setup
+
+```{r setup, echo=T, results='hide'}
+library(tidygraph)
+library(tidyverse)
+library(igraph)
+library(ggplot2)
+library(vroom)
+library(arrow)
+library(scales)
+library(ggraph)
+library(ggtext)
+library(ggrepel)
+library(ggforce)
+library(ggthemes)
+library(patchwork)
+library(qualpalr)
+library(gender)
+library(wru)
+library(skimr)
+
+# setwd("./Exercise 3")
+```
+
+# Code
+
+## Loading and viewing the data
+```{r}
+patent_data <- read_parquet("app_data_sample.parquet")
+edge_data <- vroom("edges_sample.csv", delim = ",")
+```
+
+```{r}
+patent_data %>% head(10)
+```
+
+## Get gender for examiners
+
+Using the library `gender`, extract the gender from a list of distinct `examiner_name_first` values. This will give us the gender of each first name according to the library, which we can then join to our original data
+```{r}
+examiner_names <- patent_data %>%
+  distinct(examiner_name_first)
+
+examiner_names_gender <- examiner_names %>%
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>%
+  unnest(cols = c(results), keep_empty = TRUE) %>%
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+
+examiner_names_gender <- examiner_names_gender %>%
+  select(examiner_name_first, gender)
+
+patent_data <- patent_data %>%
+  left_join(
+    examiner_names_gender,
+    by = "examiner_name_first"
+  )
+
+patent_data %>% head(10)
+```
+
+## Guess race for examiners
+
+Using the library `wru`, extract race from a list of distinct `examiner_name_first` values. This will give us the race probabilities of each last name according to the library, which we can then take a maximum on and join the results to our original data. 
+
+This process involves using the `predict_race` function from the `wru` package, which estimates the race/ethnicity of a name based on U.S. Census data. It's important to note that this method provides an estimate based on statistical models and should be used with an understanding of its limitations and potential biases.
+
+
+```{r}
+examiner_surnames <- patent_data %>%
+  select(surname = examiner_name_last) %>%
+  distinct()
+
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = TRUE) %>% as_tibble()
+
+examiner_race <- examiner_race %>%
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>%
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  )) %>%
+  select(surname, race)
+
+patent_data <- patent_data %>%
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+
+patent_data %>% head(10)
+```
+
+## Examiner's tenure
+
+To estimate the time spent by each examiner, we compare the earliest and latest dates for each application. We then calculate the difference between these two dates to get the tenure of each examiner and only keep those who finished their tenure before 2018.
+
+```{r}
+examiner_dates <- patent_data %>%
+  select(examiner_id, filing_date, appl_status_date) %>%
+  mutate(
+    start_date = ymd(filing_date),
+    end_date = as_date(dmy_hms(appl_status_date))
+  )
+
+examiner_dates <- examiner_dates %>%
+  group_by(examiner_id) %>%
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE),
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+  ) %>%
+  filter(year(latest_date) < 2018)
+
+patent_data <- patent_data %>%
+  left_join(examiner_dates, by = "examiner_id")
+
+patent_data %>% head(10)
+```
+
+```{r}
+rm(examiner_dates)
+rm(examiner_race)
+rm(examiner_surnames)
+rm(examiner_names)
+gc()
+```
+
+
+## Viewing the cleaned dataset
+
+```{r}
+patent_data
+```
+
+## Picking workgroup
+
+To select the workgroups of interest, we first create a new column `workgroup` to store the first 3 digits of the `examiner_art_unit` column. We then count the number of applications in each workgroup and sort them in descending order to see which workgroups to choose.
+
+```{r}
+patent_data <- patent_data %>%
+  mutate(workgroup = examiner_art_unit %/% 10)
+
+patent_data %>%
+  count(workgroup, sort = TRUE)
+```
+
+## Demographic overview for workgroup 164 and 176
+
+With the workgroups chosen, we filter the data to only include applications from these workgroups. We then create some summary plots to compare the two.
+
+
+
+
+```{r}
+workgroups_chosen <- c(164, 176)
+
+workgroup_patent_data <- patent_data %>%
+  filter(workgroup %in% workgroups_chosen)
+
+workgroup_patent_data
+```
+
+For demographic overview, we aim to visualize the distribution of gender and race within the selected workgroups, as well as examining the tenure days of examiners. These visualizations will help in understanding the diversity and experience within these groups. To achieve this, we will create summary plots for gender, race, and tenure days for workgroups 164 and 176.
+
+```{r fig.width=20, fig.height=10}
+# Define a consistent color palette
+color_palette <- scale_fill_brewer(palette = "Set2")
+
+# Gender distribution plot
+p1 <- workgroup_patent_data %>%
+  ggplot(aes(x = gender, fill = as.factor(workgroup))) +
+  geom_bar(position = position_dodge2(width = 0.7)) +
+  labs(title = "Gender Distribution", x = "Gender", y = "Count", fill = "Workgroup") +
+  theme_minimal() +
+  color_palette +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+
+# Race distribution plot
+p2 <- workgroup_patent_data %>%
+  ggplot(aes(x = race, fill = as.factor(workgroup))) +
+  geom_bar(position = position_dodge2(width = 0.7)) +
+  labs(title = "Race Distribution", x = "Race", y = "Count", fill = "Workgroup") +
+  theme_minimal() +
+  color_palette +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+# Tenure days histogram
+p3 <- workgroup_patent_data %>%
+  ggplot(aes(x = tenure_days, fill = as.factor(workgroup))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Tenure Days Distribution", x = "Tenure Days", y = "Frequency", fill = "Workgroup") +
+  theme_minimal() +
+  color_palette +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+
+# Combine plots
+combined_plot <- p1 + p2 + p3 +
+  plot_annotation(
+    title = "USPTO Workgroup 164 & 176 Demographic and Tenure Overview",
+    caption = "Data: USPTO | Graphic: @lakshyaag",
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+      plot.caption = element_text(size = 10, hjust = 0.5)
+    )
+  )
+
+# Display the combined plot
+combined_plot
+
+ggsave("demographic_overview.png", device = "png", dpi = 300, width = 16, height = 9)
+```
+
+- There is a notable difference in gender representation, with males being more prevalent than females in both workgroups.
+- The 'white' category has the highest count in both workgroups, indicating that white individuals are the most represented race. The 'Asian' category is the second most represented, followed by 'black' and 'Hispanic' categories, which have considerably lower counts. This suggests that there is less racial diversity within these workgroups, with a clear majority of white individuals.
+
+Now we look at the mean tenure days and mean number of applications for each workgroup to understand the experience and workload of examiners in these groups.
+
+```{r}
+workgroup_patent_data %>%
+  group_by(workgroup) %>%
+  summarise(
+    mean_tenure = mean(tenure_days, na.rm = TRUE),
+    num_applications = n()
+  )
+```
+
+Workgroup 164 has a higher mean tenure of ~6100 days, as compared to ~5500 days in Workgroup 176.
+
+## Creating a network
+
+To create a network of examiners, we first need to alter the edge and node datasets to match the format expected by the `tidygraph` package. We then create a graph object using the `tbl_graph` function and add node data to it. We then calculate the degree, betweenness, and closeness centrality measures for each node and visualize the network using `ggraph`.
+
+```{r}
+edge_data <- edge_data %>%
+  mutate(
+    from = as.character(ego_examiner_id),
+    to = as.character(alter_examiner_id)
+  ) %>%
+  drop_na()
+```
+
+```{r}
+patent_data <- patent_data %>%
+  relocate(examiner_id, .before = application_number) %>%
+  mutate(examiner_id = as.character(examiner_id)) %>%
+  drop_na(examiner_id) %>%
+  rename(name = examiner_id)
+
+patent_data
+```
+
+This next chunk of code will create the overall USPTO graph from the provided edge list.
+
+```{r}
+graph <- tbl_graph(
+  edges = (edge_data %>% relocate(from, to)),
+  directed = TRUE
+)
+
+graph <- graph %>%
+  activate(nodes) %>%
+  inner_join(
+    (patent_data %>% distinct(name, .keep_all = TRUE)),
+    by = "name"
+  )
+
+graph
+```
+
+```{r}
+graph %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    betweenness = centrality_betweenness(),
+    closeness = centrality_closeness()
+  ) %>%
+  select(name, degree, betweenness, closeness) %>%
+  arrange(-degree)
+```
+
+```{r}
+graph %>%
+  ggraph(layout = "fr") +
+  geom_node_point() +
+  geom_edge_link()
+```
+
+Looking only at the workgroup data
+
+
+```{r}
+workgroup_nodes <- workgroup_patent_data %>%
+  select(examiner_id) %>%
+  distinct() %>%
+  mutate(examiner_id = as.character(examiner_id))
+
+workgroup_nodes
+```
+
+```{r}
+# Filter only the nodes that are present in the workgroup data
+workgroup_graph <- graph %>%
+  activate(nodes) %>%
+  filter(name %in% workgroup_nodes$examiner_id)
+
+workgroup_graph
+```
+
+```{r}
+workgroup_graph %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    betweenness = centrality_betweenness(),
+    closeness = centrality_closeness()
+  ) %>%
+  select(name, degree, betweenness, closeness) %>%
+  arrange(-degree)
+```
+
+Checking out examiner 97910 and associated mentees
+```{r}
+workgroup_graph %>%
+  activate(edges) %>%
+  filter(ego_examiner_id == 97910)
+```
+
+# Plotting the network, colored by gender
+```{r fig.width=20, fig.height=10}
+gender_network <- workgroup_graph %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(
+      start_cap = label_rect(node1.name),
+      end_cap = label_rect(node2.name)
+    ),
+    arrow = arrow(length = unit(4, "mm")),
+    alpha = 0.8
+  ) +
+  geom_node_point(aes(color = gender), size = 4, alpha = 0.9) +
+  scale_color_tableau() +
+  labs(color = "Gender", title = "By gender") +
+  theme_void() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(fill = NA, color = "black"),
+  )
+
+race_network <- workgroup_graph %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(
+      start_cap = label_rect(node1.name),
+      end_cap = label_rect(node2.name)
+    ),
+    arrow = arrow(length = unit(4, "mm")),
+    alpha = 0.8
+  ) +
+  geom_node_point(aes(color = race), size = 4, alpha = 0.9) +
+  scale_color_tableau() +
+  labs(color = "Race", title = "By race") +
+  theme_void() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(fill = NA, color = "black"),
+  )
+
+
+combined_network <- gender_network + race_network +
+  plot_annotation(
+    title = "USPTO Workgroup 164 & 176 Examiner Network",
+    caption = "Data: USPTO | Graphic: @lakshyaag",
+    theme = theme(
+      plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+      plot.caption = element_text(size = 10, hjust = 0.5)
+    )
+  )
+
+combined_network
+
+ggsave("workgroup_network.png", device="png", dpi=300, width=20, height=10)
+```
+
