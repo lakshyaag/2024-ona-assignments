@@ -1,0 +1,448 @@
+---
+title: 'Exercise 4: ORGB 672'
+author: "Lakshya Agarwal"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: 
+    toc: true
+    number_sections: true
+    highlight: tango
+  github_document:
+    toc: true
+---
+
+\newpage
+
+# Setup
+
+```{r setup, echo=T, results='hide'}
+library(tidygraph)
+library(tidyverse)
+library(igraph)
+library(ggplot2)
+library(vroom)
+library(arrow)
+library(scales)
+library(purrr)
+library(broom)
+library(ggraph)
+library(ggtext)
+library(ggrepel)
+library(ggforce)
+library(ggthemes)
+library(patchwork)
+library(qualpalr)
+library(gender)
+library(wru)
+library(skimr)
+library(lubridate)
+
+# setwd("./Exercise 4")
+```
+
+# Code
+
+## Loading and viewing the data
+
+```{r}
+patent_data <- read_parquet("app_data_sample.parquet")
+edge_data <- vroom("edges_sample.csv", delim = ",")
+```
+
+### Dropping applications with pending status
+
+```{r}
+patent_data <- patent_data %>%
+  filter(disposal_type != "PEND")
+```
+
+```{r}
+patent_data
+```
+
+## Get gender and race for examiners
+
+Using the library `gender`, extract the gender from a list of distinct
+`examiner_name_first` values. This will give us the gender of each first
+name according to the library, which we can then join to our original
+data
+
+```{r}
+examiner_names <- patent_data %>%
+  distinct(examiner_name_first)
+
+examiner_names_gender <- examiner_names %>%
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>%
+  unnest(cols = c(results), keep_empty = TRUE) %>%
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+
+examiner_names_gender <- examiner_names_gender %>%
+  select(examiner_name_first, gender)
+
+patent_data <- patent_data %>%
+  left_join(
+    examiner_names_gender,
+    by = "examiner_name_first"
+  )
+
+patent_data %>% head(10)
+```
+
+Using the library `wru`, extract race from a list of distinct
+`examiner_name_first` values. This will give us the race probabilities
+of each last name according to the library, which we can then take a
+maximum on and join the results to our original data.
+
+This process involves using the `predict_race` function from the `wru`
+package, which estimates the race/ethnicity of a name based on U.S.
+Census data. It's important to note that this method provides an
+estimate based on statistical models and should be used with an
+understanding of its limitations and potential biases.
+
+```{r}
+examiner_surnames <- patent_data %>%
+  select(surname = examiner_name_last) %>%
+  distinct()
+
+examiner_race <- predict_race(
+  voter.file = examiner_surnames,
+  surname.only = TRUE
+) %>% as_tibble()
+
+examiner_race <- examiner_race %>%
+  mutate(max_race_p = pmax(
+    pred.asi,
+    pred.bla,
+    pred.his,
+    pred.oth,
+    pred.whi
+  )) %>%
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  )) %>%
+  select(surname, race)
+
+patent_data <- patent_data %>%
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+
+patent_data %>% head(10)
+```
+
+## Calculate application processing time
+
+To estimate the time spent by on each application, we compare the filing
+date and application status dates for each application. We then
+calculate the difference between these two dates as the processing time.
+
+```{r}
+patent_data <- patent_data %>%
+  mutate(app_proc_time = interval(
+    ymd(filing_date),
+    dmy_hms(appl_status_date)
+  ) %/% days(1))
+
+patent_data %>% head(10)
+```
+
+```{r}
+rm(examiner_race)
+rm(examiner_surnames)
+rm(examiner_names)
+gc()
+```
+
+## Viewing the cleaned dataset
+
+```{r}
+patent_data
+```
+
+## Creating a network
+
+To create a network of examiners, we first need to alter the edge and
+node datasets to match the format expected by the `tidygraph` package.
+We then create a graph object using the `tbl_graph` function and add
+node data to it. We then calculate the degree, betweenness, and
+closeness centrality measures for each node and visualize the network
+using `ggraph`.
+
+```{r}
+edge_data <- edge_data %>%
+  mutate(
+    from = as.character(ego_examiner_id),
+    to = as.character(alter_examiner_id)
+  ) %>%
+  drop_na()
+```
+
+```{r}
+patent_data <- patent_data %>%
+  relocate(examiner_id, .before = application_number) %>%
+  mutate(examiner_id = as.character(examiner_id)) %>%
+  drop_na(examiner_id) %>%
+  rename(name = examiner_id)
+
+patent_data
+```
+
+This next chunk of code will create the overall USPTO graph from the
+provided edge list.
+
+```{r}
+graph <- tbl_graph(
+  edges = (edge_data %>% relocate(from, to)),
+  directed = TRUE
+)
+
+graph <- graph %>%
+  activate(nodes) %>%
+  inner_join(
+    (patent_data %>% distinct(name, .keep_all = TRUE)),
+    by = "name"
+  )
+
+graph
+```
+
+## Calculating the centrality measures
+
+For each examiner in the network, calculate the different centrality
+measures: degree, betweenness, and closeness.
+
+```{r}
+node_data <- graph %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    betweenness = centrality_betweenness(),
+    closeness = centrality_closeness()
+  ) %>%
+  arrange(-degree) %>%
+  as_tibble() %>%
+  mutate(tc = as.factor(tc))
+
+node_data
+```
+
+## Running regression models
+
+We will now run a series of regression models to explore the
+relationship between the centrality measures and the application
+processing time.
+
+To do so, first we define a function that runs a regression model for a
+given centrality measure and returns the summary statistics.
+
+```{r}
+run_regression <- function(data, x, y, plot = TRUE) {
+  formula <- as.formula(paste(y, "~", x))
+  model <- lm(formula, data = data)
+
+  if (plot) {
+    plot_data <- ggplot(data, aes_string(x, y)) +
+      geom_point() +
+      geom_smooth(method = "lm", se = FALSE) +
+      labs(
+        title = paste("Regression of", y, "on", x),
+        subtitle = paste("R-squared:", round(summary(model)$r.squared, 4)),
+        x = x,
+        y = y
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 14)
+      ) +
+      plot_annotation(
+        caption = "Source: USPTO Data | Graphic: @lakshyaag"
+      )
+
+    ggsave(paste0(y, "_on_", x, ".png"), plot_data, width = 16, height = 9)
+
+    print(plot_data)
+  }
+
+  # Return a tidy dataframe of the model summary
+  tidy_model <- tidy(model)
+  glance_model <- glance(model)
+
+  # Add R-squared and centrality measure (extracted from x) to the tidy dataframe
+  tidy_model <- tidy_model %>%
+    mutate(
+      r_squared = glance_model$r.squared,
+      centrality_measure = x
+    )
+
+  return(tidy_model)
+}
+```
+
+### Application time on degree centrality
+
+```{r fig.width=16, fig.height=9}
+run_regression(node_data, "degree", "app_proc_time")
+```
+
+### Application time on betweenness centrality
+
+```{r fig.width=16, fig.height=9}
+run_regression(node_data, "betweenness", "app_proc_time")
+```
+
+### Application time on closeness centrality
+
+```{r fig.width=16, fig.height=9}
+run_regression(node_data, "closeness", "app_proc_time")
+```
+
+### Application times on all centrality measures and gender and race
+
+Since the above models have a very low R-squared value, we now add
+additional variables to the model to see if we can improve the fit,
+starting with gender and race.
+
+```{r}
+centrality_measures <- c("degree", "betweenness", "closeness")
+
+results_df <- map_dfr(
+  centrality_measures,
+  ~ run_regression(node_data,
+    paste0(.x, " * gender * race"),
+    "app_proc_time",
+    plot = FALSE
+  )
+)
+
+# Looking at the R-squared values for each model
+results_df %>%
+  select(centrality_measure, r_squared) %>%
+  distinct()
+```
+
+### Application time on all centrality measures, gender and race, with other variables
+
+Now we include other important variables, namely `disposal_type` and
+`tc`.
+
+```{r}
+results_df_2 <- map_dfr(
+  centrality_measures,
+  ~ run_regression(node_data,
+    paste0(.x, " * gender * race + disposal_type + tc"),
+    "app_proc_time",
+    plot = FALSE
+  )
+)
+
+# Looking at the R-squared values for each model
+results_df_2 %>%
+  select(centrality_measure, r_squared) %>%
+  distinct()
+```
+
+## Looking at the final model closely
+
+```{r fig.width=16, fig.height=9}
+best_model <- results_df_2 %>%
+  filter(str_starts(centrality_measure, "degree"))
+
+model_coeffs <- ggplot(
+  best_model %>% filter(term != "(Intercept)") %>% filter(p.value < 0.05),
+  aes(
+    x = term,
+    y = estimate,
+    ymin = estimate - std.error,
+    ymax = estimate + std.error
+  )
+) +
+  geom_point(color = "#0072B2", size = 2) +
+  geom_errorbar(color = "#0072B2", fatten = 4, lwd = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkred", lwd = 1) +
+  coord_flip() +
+  labs(
+    title = "Regression of Application Processing Time on Degree Centrality",
+    subtitle = "Only significant coefficients shown (p < 0.05)",
+    x = "Variable",
+    y = "Estimate",
+    caption = "Source: USPTO Data | Graphic: @lakshyaag"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "#e5e5e5"),
+    panel.grid.minor = element_blank(),
+  )
+
+model_coeffs
+
+ggsave("model_coeffs.png", model_coeffs, width = 16, height = 9)
+
+best_model
+```
+
+# Interpretation of the model
+
+The selected model fits the application processing time as a function
+of: 
+$$
+\begin{aligned}
+y &= \beta_0 + \beta_1 \cdot \text{DegreeCentrality} + \\
+  & \beta_2 \cdot \text{Gender} + \beta_3 \cdot \text{Race} + \\
+  & \beta_4 \cdot \text{DisposalType} + \beta_5 \cdot \text{TechnologyCenter} + \\
+  & \beta_6 \cdot (\text{DegreeCentrality} \times \text{Gender}) + \\
+  & \beta_7 \cdot (\text{DegreeCentrality} \times \text{Race}) + \\
+  & \beta_8 \cdot (\text{Gender} \times \text{Race}) + \\
+  & \beta_9 \cdot (\text{DegreeCentrality} \times \text{Gender} \times \text{Race}) + \epsilon
+\end{aligned}
+$$ 
+
+where $y$ represents the application processing time.
+
+The model has an R-squared value of 0.135, indicating that 13.5% of the
+variance in application processing time can be explained by the
+variables included in the model. The coefficients of the model indicate
+the effect of each variable on the application processing time.
+
+The base variables for the categorical variables are:
+
+-   Gender: `female`
+-   Race: `Asian`
+-   Disposal Type: `ABN`
+-   TC: `1600`
+
+Keeping only the significant coefficients with a p-value of less than
+0.05, we can see that:
+
+-   The degree centrality coefficient of 12.6 indicates that a one-unit
+    increase in degree centrality is associated with a 12.6 day increase
+    in application processing time. This suggests that examiners with
+    higher degree centrality take longer to process applications,
+    possibly due to a higher workload or complexity of applications.
+-   The `disposal_typeISS` coefficient of 869.66 indicates that
+    applications with a `ISS` disposal type take 869.66 days longer to
+    process than applications with an `ABN` disposal type. This suggests
+    that patents that get issued take significantly longer to process
+    than those that are abandoned.
+-   The `gendermale` coefficient of 123.12 indicates that applications
+    assigned to a male examiner take 123.12 days longer to process than
+    applications assigned to female examiners. This suggests that there
+    may be delays or differences in processing times based on the gender
+    of the examiner.
+
+## Implications for the USPTO
+
+Understanding these relationships can help the USPTO identify factors
+influencing application processing times. If centrality significantly
+impacts processing time, strategies to distribute workloads more evenly
+or foster efficient collaboration networks could be considered.
+Additionally, identifying any disparities by gender / race could inform
+policies to ensure equitable work environments.
